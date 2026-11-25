@@ -962,8 +962,10 @@
   function fromPanel(panel) {
     const ui = name => panel.querySelector(`[data-ui="${name}"]`);
     const rows = selector => [...panel.querySelectorAll(selector)].map(row => ({ enabled: row.querySelector('[type=checkbox]').checked, percent: Number(row.querySelector('[type=number]').value), value: row.querySelector('select').value }));
+    const sellingList = panel.querySelector('[data-sell="list"]');
     const shoppingList = panel.querySelector('[data-buy="list"]');
     return {
+      ...(sellingList ? { selling: { enabled: !!panel.querySelector('[data-sell="enabled"]')?.checked, rules: [...sellingList.options].map(option => ({ name: option.value })) } } : {}),
       ...(shoppingList ? { shopping: { enabled: !!panel.querySelector('[data-buy="enabled"]')?.checked, rules: [...shoppingList.options].map(option => ({ name: option.value, target: Number(option.dataset.target) })) } } : {}),
       health: { rules: rows('[data-health="rows"] .health-row').map(({ value, ...rule }) => ({ ...rule, kind: value })) },
       extra: { rules: rows('.protection-extra .health-row').map(({ value, ...rule }) => ({ ...rule, name: value })), idle: { enabled: !!panel.querySelector('[data-extra="idle"]')?.checked, seconds: Number(panel.querySelector('[data-extra="seconds"]')?.value || 7) } },
@@ -1135,6 +1137,78 @@
   return {create,mount};
 });
 
+(function(root,factory){if(typeof module==='object'&&module.exports)module.exports=factory();else root.天仁自動販賣=factory();})(typeof window==='undefined'?globalThis:window,()=>{
+  const eligible=item=>item&&Number.isSafeInteger(item.id)&&item.id>0&&Number.isSafeInteger(item.count)&&item.count>0&&item.fullName&&item.fullName!=='金幣'&&!item.equipped&&!item.wielding&&!item.locked&&!/[（(]\s*(揮舞|穿戴)\s*[）)]/.test(item.fullName);
+  function create(a){
+    const schedule=a.schedule||setTimeout,cancel=a.cancel||clearTimeout,defer=a.defer||queueMicrotask;
+    let enabled=false,rules=[],pending=null,timer=null,ready=a.initialReady===true,disposed=false,paused=false,status='未啟動',revision=0,lastCheck='';
+    const settings=()=>({enabled,rules:rules.map(rule=>({...rule}))});
+    const state=()=>({...settings(),pending:!!pending,status});
+    const changed=()=>{if(!disposed)a.changed?.(state())};
+    const text=value=>{if(status!==value){status=value;changed()}};
+    const cancelTick=()=>{if(timer!==null)cancel(timer);timer=null};
+    function release(){if(pending)cancel(pending.deadline);pending=null;changed()}
+    function halt(message){release();paused=true;cancelTick();text(message+'；取消再勾選啟動可重試')}
+    function wake(){if(timer===null&&!disposed&&enabled&&!paused&&!pending&&rules.length)timer=schedule(()=>{timer=null;tick();wake()},1000)}
+    function inventory(){const items=a.all();if(!Array.isArray(items)||items.some(item=>!item.fullName||!Number.isSafeInteger(item.count)||item.count<=0))throw Error('背包資料不完整');return items}
+    const gold=items=>items.filter(item=>item.fullName==='金幣').reduce((sum,item)=>sum+item.count,0);
+    const selected=items=>items.filter(item=>eligible(item)&&rules.some(rule=>rule.name===item.fullName));
+    function confirm(){if(pending?.phase!=='sale')return;try{const items=inventory(),p=pending;if(p.lines.every(line=>{const item=items.find(item=>item.id===line.id);return !item||item.count===line.before-line.count})&&gold(items)===p.beforeGold+p.profit){release();text('販賣完成');wake()}}catch{}}
+    function tick(){
+      if(disposed||!enabled||paused||pending)return;
+      if(!ready){text('等待背包資料');return}
+      if(!rules.length){text('請新增販賣物品');return}
+      if(a.busy?.()){text('等待目前操作完成');return}
+      try{
+        const shop=a.nearby();if(!shop){text('等待商人（畫面內5格）');return}
+        if(!Number.isSafeInteger(shop.id)||shop.id<=0)return;
+        if(lastCheck===`${shop.id}:${revision}`)return;
+        const items=inventory(),candidates=selected(items);
+        if(!candidates.length){text('等待清單物品');return}
+        if(candidates.some(item=>a.blockedItem?.(item.fullName))){halt('物品同時在購買或刪物清單');return}
+        pending={phase:'quote',shopId:shop.id,candidates:candidates.map(item=>({id:item.id,name:item.fullName,count:item.count})),deadline:null};
+        pending.deadline=schedule(()=>{if(pending)halt('商人收購資料未確認')},5000);cancelTick();text(`${shop.name}：讀取收購清單`);changed();
+        try{a.send({t:'npc.action',id:shop.id,action:'sell'})}catch{halt('無法取得收購資料')}
+      }catch{text('等待完整背包資料')}
+    }
+    function quote(msg){
+      const p=pending;if(p?.phase!=='quote'||msg.npcId!==p.shopId)return;
+      try{
+        const shop=a.nearby();if(!enabled||a.busy?.()||!shop||shop.id!==p.shopId){release();wake();return}
+        if(!Array.isArray(msg.items))throw Error();
+        const items=inventory(),prices=new Map();
+        for(const row of msg.items){if(!Number.isSafeInteger(row.id)||row.id<=0||!Number.isSafeInteger(row.price)||row.price<0||prices.has(row.id))throw Error();prices.set(row.id,row.price)}
+        const lines=[];let profit=0;
+        for(const before of p.candidates){const item=items.find(item=>item.id===before.id);if(!eligible(item)||item.fullName!==before.name||item.count!==before.count||!rules.some(rule=>rule.name===item.fullName))continue;if(a.blockedItem?.(item.fullName)){halt('物品同時在購買或刪物清單');return}const price=prices.get(item.id);if(price===undefined||price===0)continue;profit+=price*item.count;lines.push({id:item.id,count:item.count,before:item.count})}
+        if(!Number.isSafeInteger(profit)||!Number.isSafeInteger(gold(items)+profit))throw Error();
+        if(!lines.length){lastCheck=`${shop.id}:${revision}`;release();text('商人未收購清單物品');wake();return}
+        cancel(p.deadline);pending={phase:'sale',shopId:p.shopId,lines,profit,beforeGold:gold(items),deadline:null};pending.deadline=schedule(()=>{confirm();if(pending)halt('販賣結果未確認')},5000);
+        text(`${shop.name}：販賣中`);changed();
+        try{a.send({t:'shop.sell',npcId:p.shopId,lines:lines.map(({id,count})=>({id,count}))})}catch{halt('販賣結果未確認')}
+      }catch{halt('收購資料不完整，未販賣')}
+    }
+    function receive(msg){if(disposed)return;
+      if(msg.t==='world.enter'||msg.t==='conn.closed'){ready=false;lastCheck='';if(pending?.phase==='sale')halt('連線變更，販賣結果未確認');else release();return}
+      if(msg.t==='world.map'||msg.t==='world.teleport'){lastCheck='';if(pending?.phase==='sale')halt('位置變更，販賣結果未確認');else release();wake();return}
+      if(msg.t==='shop.buyList'){quote(msg);return}
+      if(['inv.list','inv.add','inv.update','inv.remove'].includes(msg.t)){revision++;defer(()=>{if(disposed)return;if(msg.t==='inv.list')ready=true;confirm();wake()})}
+    }
+    function enable(value){enabled=value===true;paused=false;lastCheck='';cancelTick();if(!enabled&&pending?.phase==='quote')release();text(enabled?'準備販賣':'未啟動');changed();tick();wake()}
+    const valid=name=>typeof name==='string'&&name.trim()===name&&name.length>0&&name.length<=200&&name!=='金幣'&&!/[（(]\s*(揮舞|穿戴)\s*[）)]/.test(name);
+    return{state,settings,tick,receive,enable,upsert(name){if(!valid(name))throw Error('請選擇可販賣物品');if(!rules.some(rule=>rule.name===name))rules.push({name});lastCheck='';changed();tick();wake()},remove(name){rules=rules.filter(rule=>rule.name!==name);lastCheck='';changed();if(!rules.length)cancelTick()},restore(value){rules=[...new Set((Array.isArray(value?.rules)?value.rules:[]).map(rule=>rule?.name).filter(valid))].map(name=>({name}));enable(value?.enabled===true)},setReady(){ready=true;tick();wake()},stop(){enable(false)},dispose(){disposed=true;cancelTick();release()}};
+  }
+  function mount(a){
+    const pane=a.pane;pane.innerHTML='<label class="buy-enable"><input type="checkbox" data-sell="enabled"> 啟動</label><button data-sell="scan">讀取物品</button><label>身上物品<select data-sell="item" aria-label="販賣物品"></select></label><div class="actions"><button data-sell="add">新增</button><button data-sell="remove">刪除</button></div><label>販賣清單<select data-sell="list" size="5" aria-label="販賣清單"></select></label><div data-sell="status" role="status">未啟動</div>';
+    const el=name=>pane.querySelector(`[data-sell="${name}"]`);let disposed=false,signature='';
+    function scan(){try{const names=[...new Set(a.all().filter(eligible).map(item=>item.fullName))],selected=el('item').value;el('item').replaceChildren(...names.map(name=>{const option=document.createElement('option');option.value=name;option.textContent=name;return option}));if(names.includes(selected))el('item').value=selected}catch{el('status').textContent='等待背包資料'}}
+    const controller=create({...a,changed(current){if(disposed)return;el('enabled').checked=current.enabled;el('status').textContent=current.status;const next=JSON.stringify(current.rules);if(next!==signature){signature=next;const selected=el('list').value;el('list').replaceChildren(...current.rules.map(rule=>{const option=document.createElement('option');option.value=rule.name;option.textContent=rule.name;return option}));if(current.rules.some(rule=>rule.name===selected))el('list').value=selected}a.changed?.(current)}});
+    el('scan').onclick=scan;el('enabled').onchange=()=>controller.enable(el('enabled').checked);el('add').onclick=()=>{try{controller.upsert(el('item').value)}catch(error){el('status').textContent=error.message}};el('remove').onclick=()=>controller.remove(el('list').value);
+    const unsubscribe=a.net.on(controller.receive);a.ready.then(()=>{if(!disposed){scan();controller.setReady()}}).catch(()=>{if(!disposed)el('status').textContent='背包讀取失敗'});
+    return{settings:controller.settings,restore:controller.restore,stop:controller.stop,recheck:controller.tick,dispose(){disposed=true;unsubscribe?.();controller.dispose()}};
+  }
+  return{eligible,create,mount};
+});
+
 (function (root) {
   root.天仁介面樣式 = `
   #裝備強化第一版{--底:#151719;--卡:#20252a;--線:#687480;--金:#e4c98b;--字:#f5f3ed;--次:#c4cbd2;position:fixed;right:14px;top:14px;width:352px;max-width:calc(100vw - 24px);z-index:2147483647;background:linear-gradient(145deg,#20252b,var(--底) 52%);color:var(--字);border:1px solid #6b6246;border-radius:15px;padding:12px;box-shadow:0 14px 36px #0007,0 1px 0 #e7d9ab18 inset;font:15px/1.5 'Microsoft JhengHei',sans-serif;box-sizing:border-box;color-scheme:dark}
@@ -1144,7 +1218,7 @@
   #裝備強化第一版 button,#裝備強化第一版 select,#裝備強化第一版 input{margin:0;font:inherit;border:1px solid var(--線);border-radius:7px;background:#272c31;color:var(--字);padding:8px;min-width:0}
   #裝備強化第一版 button{cursor:pointer;transition:background-color .15s,border-color .15s}#裝備強化第一版 button:hover:not(:disabled){background:#3a424b;border-color:#99865d}#裝備強化第一版 button:disabled{opacity:.4;cursor:default}#裝備強化第一版 :is(button,input,select):focus-visible{outline:2px solid var(--金);outline-offset:2px}
   #裝備強化第一版 .window-actions{display:flex;gap:5px;flex-shrink:0}#裝備強化第一版 .window-actions button{padding:5px 8px;font-size:13px;background:#ffffff05}#裝備強化第一版 [data-ui=close]{font-size:18px;line-height:18px;color:#c4c8be}
-  #裝備強化第一版 nav{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:3px;margin-bottom:14px;padding:3px;border:1px solid #58636e;border-radius:9px;background:#111418}#裝備強化第一版 nav button{font-size:14px;letter-spacing:-.5px;white-space:nowrap;padding:8px 0;border:1px solid transparent;background:transparent;color:#e1e6eb;min-width:0}#裝備強化第一版 nav button[aria-selected=true]{background:linear-gradient(#efdaa5,#e4c98b);color:#17191b;border-color:#dec88e;font-weight:700;box-shadow:0 2px 6px #0004}
+  #裝備強化第一版 nav{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-bottom:14px;padding:3px;border:1px solid #58636e;border-radius:9px;background:#111418}#裝備強化第一版 nav button{font-size:14px;letter-spacing:-.5px;white-space:nowrap;padding:8px 0;border:1px solid transparent;background:transparent;color:#e1e6eb;min-width:0}#裝備強化第一版 nav button[aria-selected=true]{background:linear-gradient(#efdaa5,#e4c98b);color:#17191b;border-color:#dec88e;font-weight:700;box-shadow:0 2px 6px #0004}
   #裝備強化第一版 [data-pane]{max-height:min(590px,var(--面板可用高度,calc(100dvh - 150px)));overflow:auto;scrollbar-width:thin;scrollbar-color:#84909d #151719;padding:0 2px 2px}#裝備強化第一版 [data-pane=health]{max-height:min(540px,var(--面板可用高度,calc(100dvh - 190px)));padding-right:4px}
   #裝備強化第一版 label{display:block;margin-top:10px;font-size:14px;color:var(--次)}#裝備強化第一版 select{width:100%;margin-top:4px}#裝備強化第一版 input{width:100%;font-variant-numeric:tabular-nums}#裝備強化第一版 input[type=checkbox]{width:16px;height:16px;margin:0 5px 0 0;accent-color:var(--金);vertical-align:middle;flex-shrink:0;cursor:pointer}#裝備強化第一版 select option,#裝備強化第一版 select optgroup{color:#fff;background:#272c31}
   #裝備強化第一版 .row{display:flex;gap:10px}#裝備強化第一版 .row label{flex:1;min-width:0}#裝備強化第一版 .row input{margin-top:4px}#裝備強化第一版 .actions{display:flex;gap:8px;margin:12px 0}#裝備強化第一版 .actions button{flex:1;min-height:37px}
@@ -1175,6 +1249,7 @@
     const 選擇器 = 條件.flatMap(值 => [`#裝備強化第一版 option${值}`, `#裝備強化第一版 select:has(option${值}:checked)`]);
     root.天仁介面樣式 += `${選擇器.join(',')}{color:${項.色}}`;
   }
+  root.天仁介面樣式 += '#裝備強化第一版 [data-pane=selling] [data-sell=status]{margin-top:12px;padding:9px;border:1px solid var(--線);border-radius:7px}';
 })(typeof window === 'undefined' ? globalThis : window);
 
 (function (root, factory) {
@@ -1221,7 +1296,7 @@
 (() => {
   'use strict';
   if (window.__天仁輔助) {
-    if (window.__天仁輔助.version !== '1.8.1') {
+    if (window.__天仁輔助.version !== '1.8.2') {
       try {
         const 角色名 = window.__wl?.world?.selfName?.();
         if (!角色名) { alert('角色資料尚未就緒，請稍後再點書籤，先不要重新整理。'); return; }
@@ -1248,6 +1323,7 @@
   let 血量傳送中 = false, 血量管理 = null, 保護擴充 = null, 低血傳送中 = false, 擴充道具中 = false;
   let 設定保存 = null, 正在還原 = false, 角色待還原 = false, 已選裝備 = '';
   let 購買管理 = null, 購買中 = false, 上次購買設定 = '';
+  let 販賣管理 = null, 販賣中 = false, 上次販賣設定 = '';
   let 上次血量設定 = '', 上次擴充設定 = '';
   let 使用中武器編號 = null;
   let 快捷欄快取 = { key: null, text: null, data: null };
@@ -1265,9 +1341,9 @@
   const 主框 = document.createElement('section');
   主框.id = '裝備強化第一版';
   主框.setAttribute('aria-label', '天仁輔助');
-  主框.dataset.version = '1.8.1';
-  主框.innerHTML = `<style>${window.天仁介面樣式} #裝備強化第一版 header{gap:5px} #裝備強化第一版 .brand{font-size:17px;gap:0} #裝備強化第一版 .brand-mark{display:none} #裝備強化第一版 .window-actions{align-items:center} #裝備強化第一版 [data-ui=licenseCountdown]{font-size:13px;font-weight:600;color:var(--金);font-variant-numeric:tabular-nums;white-space:nowrap;margin-right:2px} #裝備強化第一版.is-collapsed [data-ui=licenseCountdown]{display:none}</style><header><span class="brand"><span class="brand-mark" aria-hidden="true">仁</span><span>天仁輔助<span class="build-label">1.8.1 · 正式版</span></span></span><span class="window-actions"><span data-ui="licenseCountdown" aria-label="金鑰剩餘時間"></span><button data-ui="collapse" aria-label="收合面板" aria-expanded="true">收合</button><button data-ui="close" aria-label="關閉並停止">×</button></span></header>
-  <nav role="tablist" aria-label="輔助功能"><button role="tab" data-tab="health" data-ui="healthTab" aria-selected="true">血量保護</button><button role="tab" data-tab="repair" aria-selected="false">功能</button><button role="tab" data-tab="shopping" aria-selected="false">自動購買</button><button role="tab" data-tab="enchant" aria-selected="false">點裝備</button><button role="tab" data-tab="discard" aria-selected="false">自動刪物</button></nav>
+  主框.dataset.version = '1.8.2';
+  主框.innerHTML = `<style>${window.天仁介面樣式} #裝備強化第一版 header{gap:5px} #裝備強化第一版 .brand{font-size:17px;gap:0} #裝備強化第一版 .brand-mark{display:none} #裝備強化第一版 .window-actions{align-items:center} #裝備強化第一版 [data-ui=licenseCountdown]{font-size:13px;font-weight:600;color:var(--金);font-variant-numeric:tabular-nums;white-space:nowrap;margin-right:2px} #裝備強化第一版.is-collapsed [data-ui=licenseCountdown]{display:none}</style><header><span class="brand"><span class="brand-mark" aria-hidden="true">仁</span><span>天仁輔助<span class="build-label">1.8.2 · 正式版</span></span></span><span class="window-actions"><span data-ui="licenseCountdown" aria-label="金鑰剩餘時間"></span><button data-ui="collapse" aria-label="收合面板" aria-expanded="true">收合</button><button data-ui="close" aria-label="關閉並停止">×</button></span></header>
+  <nav role="tablist" aria-label="輔助功能"><button role="tab" data-tab="health" data-ui="healthTab" aria-selected="true">血量保護</button><button role="tab" data-tab="repair" aria-selected="false">功能</button><button role="tab" data-tab="shopping" aria-selected="false">自動購買</button><button role="tab" data-tab="selling" aria-selected="false">自動販賣</button><button role="tab" data-tab="enchant" aria-selected="false">點裝備</button><button role="tab" data-tab="discard" aria-selected="false">自動刪物</button></nav>
   <div data-pane="health"></div>
   <div data-pane="repair" hidden><label><input data-ui="day" type="checkbox"> 全白天</label><div data-ui="dayStatus" hidden></div><hr><label><input data-ui="autoRepair" type="checkbox" checked> 自動修武器</label><button data-ui="repairScan">重新讀取背包</button><div data-ui="repairStatus" role="status" aria-live="polite">正在讀取背包…</div></div>
   <div data-pane="enchant" hidden>
@@ -1278,6 +1354,7 @@
   <div data-ui="status" role="status" aria-live="polite">先讀取裝備，再選擇名稱。</div>
   </div>
   <div data-pane="shopping" hidden></div>
+  <div data-pane="selling" hidden></div>
   <div data-pane="discard" hidden><label><input data-ui="discardEnabled" type="checkbox"> 啟動</label><button data-ui="discardScan">讀取物品</button><label>身上物品<select data-ui="discardItem"></select></label><div class="actions"><button data-ui="discardAdd">新增</button><button data-ui="discardDelete">刪除</button></div><label>丟棄物品欄<select data-ui="discardList" size="6" aria-label="丟棄物品欄"></select></label><div data-ui="discardStatus" role="status" aria-live="polite">已停止</div></div>`;
   document.body.appendChild(主框);
   const 元素 = 名稱 => 主框.querySelector(`[data-ui="${名稱}"]`);
@@ -1335,7 +1412,7 @@
     狀態(待回覆 || 快速強化器.busy() ? '停止中，等待最後一次結果；不再發起下一次。' : '正在停止…');
   }
   async function 讀取背包() {
-    if (工作中 || 修理中 || 刪物中 || 血量傳送中) return;
+    if (工作中 || 修理中 || 刪物中 || 販賣中 || 血量傳送中) return;
     工作中 = true; 控制 = new AbortController(); 鎖定(true);
     try {
       if (document.body.classList.contains('wl-pick-item')) throw Error('請先按Esc取消目前選取');
@@ -1413,7 +1490,7 @@
   }
   async function 開始() {
     if(!window.__天仁授權.gate.valid())return;
-    if (工作中 || 修理中 || 刪物中 || 血量傳送中) { 狀態('請等待目前操作結束。'); return; }
+    if (工作中 || 修理中 || 刪物中 || 販賣中 || 血量傳送中) { 狀態('請等待目前操作結束。'); return; }
     const name = 元素('weapon').value, target = Number(元素('target').value), key = 元素('key').value;
     if (!name || 需要重讀) { 狀態('請先讀取背包'); return; }
     工作中 = true; 控制 = new AbortController(); 次數 = 0; 鎖定(true);
@@ -1493,7 +1570,7 @@
     } finally { 取消選取(); }
   }
   async function 檢查修理() {
-    if (已關閉 || !元素('autoRepair').checked || 工作中 || 修理中 || 刪物中 || 血量傳送中) return;
+    if (已關閉 || !元素('autoRepair').checked || 工作中 || 修理中 || 刪物中 || 販賣中 || 血量傳送中) return;
     if (Date.now() < 換圖暫停至 || window.__wl.world?.mapLoading === true) { 修理狀態('換地圖中，保持開啟；載入後自動繼續監看。'); return; }
     if (document.hidden) { 修理狀態('背景分頁暫停，回到遊戲後繼續監看。'); return; }
     if (document.body.classList.contains('wl-pick-item')) { 修理狀態('目前有其他選取操作，暫停修理。'); return; }
@@ -1519,7 +1596,7 @@
     finally { 修理因換圖中斷 = false; 修理因操作中斷 = false; 修理中 = false; 修理控制 = null; if (已鎖定) { 元素('repairScan').disabled = false; 鎖定(false); } }
   }
   async function 重讀修理() {
-    if (工作中 || 修理中 || 刪物中 || 血量傳送中) return;
+    if (工作中 || 修理中 || 刪物中 || 販賣中 || 血量傳送中) return;
     await 讀取背包();
     if (元素('autoRepair').checked) await 檢查修理();
     else if (!修理狀態已提示()) 修理狀態('背包已讀取，開啟開關即可監看。');
@@ -1581,7 +1658,7 @@
   主框.addEventListener('keydown', e => e.stopPropagation());
   元素('scan').onclick = 讀取背包; 元素('start').onclick = 開始; 元素('stop').onclick = 停止;
   元素('weapon').onchange = () => { 已選裝備 = 元素('weapon').value; if (!工作中) 元素('start').disabled = 需要重讀 || !元素('weapon').value; };
-  元素('close').onclick = () => { 購買管理?.stop(); 血量管理?.stop(); 保護擴充?.stop(); 停止修理(); 刪物管理?.stop(); if (工作中) 停止(); 主框.hidden = true; };
+  元素('close').onclick = () => { 販賣管理?.stop(); 購買管理?.stop(); 血量管理?.stop(); 保護擴充?.stop(); 停止修理(); 刪物管理?.stop(); if (工作中) 停止(); 主框.hidden = true; };
   const 人工介入 = e => {
     if (!e.isTrusted || 主框.contains(e.target)) return;
     if (工作中) 停止();
@@ -1594,7 +1671,7 @@
   document.addEventListener('pointerdown', 人工介入, true);
   document.addEventListener('visibilitychange', () => { if (document.hidden && 工作中) 停止(); });
   刪物管理 = window.自動刪物流程序.mount({ ui: 元素, net: 授權連線,
-    character: () => window.__wl.world?.selfName?.() || '', busy: () => 工作中 || 修理中 || 血量傳送中,
+    character: () => window.__wl.world?.selfName?.() || '', busy: () => 工作中 || 修理中 || 購買中 || 販賣中 || 血量傳送中,
     picking: () => document.body.classList.contains('wl-pick-item'),
     snapshot: () => 背包來源.snapshot(), current: id => 背包來源.item(id),
     lock(value) { 刪物中 = value; 鎖定(value); },
@@ -1616,13 +1693,21 @@
   購買管理 = window.天仁自動購買.mount({ pane: 主框.querySelector('[data-pane="shopping"]'), net: 授權連線,
     ready: 背包來源.ready, all: () => 背包來源.all(),
     nearby: () => window.天仁商店資料.nearby(window.__wl.world, text => 背包來源.decodeName(text)),
-    busy: () => 正在還原 || 角色待還原 || 工作中 || 修理中 || 刪物中 || 血量傳送中 || document.body.classList.contains('wl-pick-item'),
-    blockedItem: name => 元素('discardEnabled').checked && [...元素('discardList').options].some(option => option.value === name),
+    busy: () => 正在還原 || 角色待還原 || 工作中 || 修理中 || 刪物中 || 販賣中 || 血量傳送中 || document.body.classList.contains('wl-pick-item'),
+    blockedItem: name => (元素('discardEnabled').checked && [...元素('discardList').options].some(option => option.value === name)) || (販賣管理?.settings().enabled && 販賣管理.settings().rules.some(rule => rule.name === name)),
     send(msg) { 授權連線.send(msg); },
     changed(state) { 購買中 = state.pending; const next = JSON.stringify({ enabled: state.enabled, rules: state.rules }); if (next !== 上次購買設定) { 上次購買設定 = next; if (!正在還原 && !已關閉 && !角色待還原) 設定保存?.save('shopping'); } }
   });
+  販賣管理 = window.天仁自動販賣.mount({ pane: 主框.querySelector('[data-pane="selling"]'), net: 授權連線,
+    ready: 背包來源.ready, all: () => 背包來源.all(),
+    nearby: () => window.天仁商店資料.nearby(window.__wl.world, text => 背包來源.decodeName(text)),
+    busy: () => 正在還原 || 角色待還原 || 工作中 || 修理中 || 刪物中 || 購買中 || 血量傳送中 || 背包來源.loading() || document.body.classList.contains('wl-pick-item'),
+    blockedItem: name => (元素('discardEnabled').checked && [...元素('discardList').options].some(option => option.value === name)) || (購買管理.settings().enabled && 購買管理.settings().rules.some(rule => rule.name === name)),
+    send(msg) { 授權連線.send(msg); },
+    changed(state) { 販賣中 = state.pending; const next = JSON.stringify({ enabled: state.enabled, rules: state.rules }); if (next !== 上次販賣設定) { 上次販賣設定 = next; if (!正在還原 && !已關閉 && !角色待還原) 設定保存?.save('selling'); } }
+  });
   設定保存 = window.天仁角色設定.create({ storage: localStorage, character: () => window.__wl.world?.selfName?.() || '',
-    capture: () => ({ health: 血量管理.settings(), extra: 保護擴充.settings(), shopping: 購買管理.settings(),
+    capture: () => ({ health: 血量管理.settings(), extra: 保護擴充.settings(), shopping: 購買管理.settings(), selling: 販賣管理.settings(),
       general: { repair: 元素('autoRepair').checked, discard: 元素('discardEnabled').checked, day: 元素('day').checked },
       enchant: { name: 已選裝備 || 元素('weapon').value, key: 元素('key').value, target: Number(元素('target').value) } }),
     apply(value) {
@@ -1634,14 +1719,14 @@
         已選裝備 = typeof value.enchant?.name === 'string' ? value.enchant.name : '';
         元素('key').value = value.enchant?.key === 'F6' ? 'F6' : 'F5';
         元素('target').value = Number.isInteger(value.enchant?.target) && value.enchant.target >= 1 && value.enchant.target <= 15 ? value.enchant.target : 7;
-        血量管理.restore(value.health); 保護擴充.restore(value.extra); 購買管理.restore(value.shopping);
+        血量管理.restore(value.health); 保護擴充.restore(value.extra); 購買管理.restore(value.shopping); 販賣管理.restore(value.selling);
       } finally { 正在還原 = false; }
-      血量管理.recheck(); 保護擴充.recheck(); 購買管理.recheck();
+      血量管理.recheck(); 保護擴充.recheck(); 購買管理.recheck(); 販賣管理.recheck();
     }, error: message => 狀態(message)
   });
   function 保存欄位(event) {
     if (event.target.validity && !event.target.validity.valid) return;
-    const section = event.target.closest('[data-pane="shopping"]') ? 'shopping' : event.target.closest('.protection-extra') ? 'extra' : event.target.closest('[data-pane="health"]') ? 'health' : event.target.closest('[data-pane="enchant"]') ? 'enchant' : 'general';
+    const section = event.target.closest('[data-pane="selling"]') ? 'selling' : event.target.closest('[data-pane="shopping"]') ? 'shopping' : event.target.closest('.protection-extra') ? 'extra' : event.target.closest('[data-pane="health"]') ? 'health' : event.target.closest('[data-pane="enchant"]') ? 'enchant' : 'general';
     設定保存.save(section);
   }
   主框.addEventListener('change', 保存欄位); 主框.addEventListener('input', 保存欄位);
@@ -1650,16 +1735,16 @@
     if (msg.t === 'world.enter' || msg.t === 'self.status' || msg.t === 'obj.put' && msg.obj?.id === window.__wl.world?.selfId) queueMicrotask(() => { if (!已關閉 && 設定保存.sync(角色待還原)) 角色待還原 = false; });
   });
   設定保存.sync();
-  window.__天仁輔助 = { version: '1.8.1', show() { 主框.hidden = false; 元素('healthTab').click(); }, close() { 購買管理?.stop(); 血量管理?.stop(); 保護擴充?.stop(); 停止修理(); 刪物管理?.stop(); 停止(); 主框.hidden = true; } };
+  window.__天仁輔助 = { version: '1.8.2', show() { 主框.hidden = false; 元素('healthTab').click(); }, close() { 販賣管理?.stop(); 購買管理?.stop(); 血量管理?.stop(); 保護擴充?.stop(); 停止修理(); 刪物管理?.stop(); 停止(); 主框.hidden = true; } };
   window.__天仁輔助.licenseStop = () => {
     if(已關閉)return;
     設定保存?.save(); 已關閉=true;
     window.__天仁輔助.close();
     if(原始暗度 && world.darkness===全亮){world.darkness=原始暗度;world.drawDark();}
-    clearInterval(監看計時器); 設定訊息?.(); 購買管理?.dispose(); 保護擴充?.dispose(); 快速強化器.dispose(); 血量管理?.dispose(); 刪物管理?.dispose();
+    clearInterval(監看計時器); 設定訊息?.(); 販賣管理?.dispose(); 購買管理?.dispose(); 保護擴充?.dispose(); 快速強化器.dispose(); 血量管理?.dispose(); 刪物管理?.dispose();
     控制?.abort(); 修理控制?.abort(); if(typeof 取消監聽==='function')取消監聽(); 移除拖曳(); 主框.remove();
   };
-  window.addEventListener('pagehide', () => { if (!角色待還原) 設定保存.save(); 已關閉 = true; 移除拖曳(); 設定訊息?.(); 購買管理?.dispose(); 保護擴充?.dispose(); 快速強化器.dispose(); 血量管理?.dispose(); 刪物管理?.dispose(); 控制?.abort(); 修理控制?.abort(); clearInterval(監看計時器); if (typeof 取消監聽 === 'function') 取消監聽(); }, { once: true });
+  window.addEventListener('pagehide', () => { if (!角色待還原) 設定保存.save(); 已關閉 = true; 移除拖曳(); 設定訊息?.(); 販賣管理?.dispose(); 購買管理?.dispose(); 保護擴充?.dispose(); 快速強化器.dispose(); 血量管理?.dispose(); 刪物管理?.dispose(); 控制?.abort(); 修理控制?.abort(); clearInterval(監看計時器); if (typeof 取消監聽 === 'function') 取消監聽(); }, { once: true });
   背包來源.ready.then(() => { if (元素('autoRepair').checked) 檢查修理(); }).catch(error => 修理狀態(error.message));
 })();
 
