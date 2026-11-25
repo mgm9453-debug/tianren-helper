@@ -999,20 +999,25 @@
     [1000000899, '畢伍斯', [1,12,13,14,16,17,18,19,20,24,25,21,22,28,23,null,null]]
   ];
   const shops = rows.map(([id, name, orders, overrides = {}]) => ({ id, name, items: items.flatMap((name, index) => orders[index] == null ? [] : [{ name, orderId: orders[index], price: overrides[name] ?? prices[index] }]) }));
+  const shopsByName = new Map(shops.map(shop => [shop.name, shop]));
   function nearby(world, decode = x => x) {
     const self = world?.self, screen = world?.app?.screen;
-    if (!self || self.dead || !screen || !world.ents?.get || world.mapLoadBusy === true || world.mapLoading === true) return null;
+    if (!self || self.dead || !screen || !world.ents?.entries || world.mapLoadBusy === true || world.mapLoading === true) return null;
     const start = world.screenToWorld(0, 0), end = world.screenToWorld(screen.width, screen.height);
     const candidates = [];
-    for (const shop of shops) {
-      const entity = world.ents.get(shop.id);
+    for (const [id, entity] of world.ents.entries()) {
       if (!entity || entity.obj?.kind !== 'npc' || entity.dead || entity.crowdHidden || entity.root?.visible !== true) continue;
-      if (String(decode(entity.obj.name || '')).trim().replace(/^雜貨商\s*/, '') !== shop.name) continue;
+      if (!Number.isSafeInteger(id) || id <= 0 || entity.obj.id !== id) continue;
       if (![entity.gx, entity.gy, self.gx, self.gy].every(Number.isFinite)) continue;
       const distance = Math.max(Math.abs(entity.gx-self.gx), Math.abs(entity.gy-self.gy));
+      if (distance > 5) continue;
+      let name;
+      try { name = String(decode(entity.obj.name || '')).trim().replace(/^雜貨商\s*/, ''); } catch { continue; }
+      const shop = shopsByName.get(name);
+      if (!shop) continue;
       const point = world.smoothFoot(entity);
       if (distance > 5 || ![point.x,point.y,start.x,start.y,end.x,end.y].every(Number.isFinite) || point.x < start.x || point.y < start.y || point.x > end.x || point.y > end.y) continue;
-      candidates.push({ ...shop, distance });
+      candidates.push({ ...shop, id, distance });
     }
     return candidates.sort((a,b) => a.distance-b.distance || a.id-b.id)[0] || null;
   }
@@ -1216,7 +1221,7 @@
 (() => {
   'use strict';
   if (window.__天仁輔助) {
-    if (window.__天仁輔助.version !== '1.8.0') {
+    if (window.__天仁輔助.version !== '1.8.1') {
       try {
         const 角色名 = window.__wl?.world?.selfName?.();
         if (!角色名) { alert('角色資料尚未就緒，請稍後再點書籤，先不要重新整理。'); return; }
@@ -1260,8 +1265,8 @@
   const 主框 = document.createElement('section');
   主框.id = '裝備強化第一版';
   主框.setAttribute('aria-label', '天仁輔助');
-  主框.dataset.version = '1.8.0';
-  主框.innerHTML = `<style>${window.天仁介面樣式} #裝備強化第一版 header{gap:5px} #裝備強化第一版 .brand{font-size:17px;gap:0} #裝備強化第一版 .brand-mark{display:none} #裝備強化第一版 .window-actions{align-items:center} #裝備強化第一版 [data-ui=licenseCountdown]{font-size:13px;font-weight:600;color:var(--金);font-variant-numeric:tabular-nums;white-space:nowrap;margin-right:2px} #裝備強化第一版.is-collapsed [data-ui=licenseCountdown]{display:none}</style><header><span class="brand"><span class="brand-mark" aria-hidden="true">仁</span><span>天仁輔助<span class="build-label">1.8.0 · 正式版</span></span></span><span class="window-actions"><span data-ui="licenseCountdown" aria-label="金鑰剩餘時間"></span><button data-ui="collapse" aria-label="收合面板" aria-expanded="true">收合</button><button data-ui="close" aria-label="關閉並停止">×</button></span></header>
+  主框.dataset.version = '1.8.1';
+  主框.innerHTML = `<style>${window.天仁介面樣式} #裝備強化第一版 header{gap:5px} #裝備強化第一版 .brand{font-size:17px;gap:0} #裝備強化第一版 .brand-mark{display:none} #裝備強化第一版 .window-actions{align-items:center} #裝備強化第一版 [data-ui=licenseCountdown]{font-size:13px;font-weight:600;color:var(--金);font-variant-numeric:tabular-nums;white-space:nowrap;margin-right:2px} #裝備強化第一版.is-collapsed [data-ui=licenseCountdown]{display:none}</style><header><span class="brand"><span class="brand-mark" aria-hidden="true">仁</span><span>天仁輔助<span class="build-label">1.8.1 · 正式版</span></span></span><span class="window-actions"><span data-ui="licenseCountdown" aria-label="金鑰剩餘時間"></span><button data-ui="collapse" aria-label="收合面板" aria-expanded="true">收合</button><button data-ui="close" aria-label="關閉並停止">×</button></span></header>
   <nav role="tablist" aria-label="輔助功能"><button role="tab" data-tab="health" data-ui="healthTab" aria-selected="true">血量保護</button><button role="tab" data-tab="repair" aria-selected="false">功能</button><button role="tab" data-tab="shopping" aria-selected="false">自動購買</button><button role="tab" data-tab="enchant" aria-selected="false">點裝備</button><button role="tab" data-tab="discard" aria-selected="false">自動刪物</button></nav>
   <div data-pane="health"></div>
   <div data-pane="repair" hidden><label><input data-ui="day" type="checkbox"> 全白天</label><div data-ui="dayStatus" hidden></div><hr><label><input data-ui="autoRepair" type="checkbox" checked> 自動修武器</label><button data-ui="repairScan">重新讀取背包</button><div data-ui="repairStatus" role="status" aria-live="polite">正在讀取背包…</div></div>
@@ -1645,7 +1650,7 @@
     if (msg.t === 'world.enter' || msg.t === 'self.status' || msg.t === 'obj.put' && msg.obj?.id === window.__wl.world?.selfId) queueMicrotask(() => { if (!已關閉 && 設定保存.sync(角色待還原)) 角色待還原 = false; });
   });
   設定保存.sync();
-  window.__天仁輔助 = { version: '1.8.0', show() { 主框.hidden = false; 元素('healthTab').click(); }, close() { 購買管理?.stop(); 血量管理?.stop(); 保護擴充?.stop(); 停止修理(); 刪物管理?.stop(); 停止(); 主框.hidden = true; } };
+  window.__天仁輔助 = { version: '1.8.1', show() { 主框.hidden = false; 元素('healthTab').click(); }, close() { 購買管理?.stop(); 血量管理?.stop(); 保護擴充?.stop(); 停止修理(); 刪物管理?.stop(); 停止(); 主框.hidden = true; } };
   window.__天仁輔助.licenseStop = () => {
     if(已關閉)return;
     設定保存?.save(); 已關閉=true;
