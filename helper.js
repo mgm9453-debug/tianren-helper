@@ -852,14 +852,23 @@
     const schedule = a.schedule || setTimeout, cancel = a.cancel || clearTimeout, defer = a.defer || queueMicrotask;
     let enabled = false, rules = [], pending = null, timer = null, paused = false, ready = a.initialReady === true, disposed = false, status = '未啟動';
     let revision = 0, lastCheck = '';
-    const replenishing = new Set();
+    const replenishing = new Set(), blocked = new Map();
     const settings = () => ({ enabled, rules: rules.map(x => ({ ...x })) });
-    const state = () => ({ ...settings(), pending: !!pending, paused, status });
+    const state = () => ({ ...settings(), pending: !!pending, paused, status: enabled && blocked.size ? `${status}｜跳過：${[...blocked].map(([name, reason]) => `${name}（${reason}）`).join('、')}；關閉再啟動可重試` : status });
     const changed = () => { if (!disposed) a.changed?.(state()); };
     const text = value => { if (status !== value) { status = value; changed(); } };
     function cancelTick() { if (timer != null) cancel(timer); timer = null; }
     function release() { if (pending) cancel(pending.deadline); pending = null; }
     function halt(message) { replenishing.clear(); release(); paused = true; cancelTick(); text(message + '；取消再勾選啟動可重試'); changed(); }
+    function skip(name, reason) {
+      blocked.set(name, reason);
+      replenishing.delete(name);
+      if (pending?.name === name) release();
+      lastCheck = '';
+      changed();
+      wake();
+    }
+    function idleStatus() { return blocked.size ? '沒有其他待補貨物品' : '物品尚有庫存'; }
     function wake() { if (timer == null && !disposed && enabled && !paused && !pending && rules.length) timer = schedule(() => { timer = null; tick(); wake(); }, 1000); }
     function inventory() {
       const items = a.all();
@@ -886,8 +895,7 @@
       confirm(); if (!pending) return;
       const p = pending; let current = '?';
       try { current = total(inventory(), p.name); } catch {}
-      const detail = `${p.name}未確認成交（現有${current}／目標${p.target}）`;
-      halt(detail + '，請確認交易結果');
+      skip(p.name, `未確認成交，現有${current}／目標${p.target}`);
     }
     function confirm() {
       if (!pending || disposed) return;
@@ -909,10 +917,11 @@
       try { shop = a.shopFor ? a.shopFor('肉') : a.nearby(); } catch { text('等待場景資料'); return; }
       if (!shop) { text('等待商人資料'); return; }
       const checkKey = `${a.shopFor ? rules.map(rule => a.shopFor(rule.name)?.id).join(',') : shop.id}:${revision}`;
-      if (lastCheck === checkKey) { text('物品尚有庫存'); return; }
+      if (lastCheck === checkKey) { text(idleStatus()); return; }
       try {
         const items = inventory();
         for (const rule of rules) {
+          if (blocked.has(rule.name)) continue;
           if (a.shopFor) shop = a.shopFor(rule.name);
           const product = shop.items.find(x => x.name === rule.name);
           if (!product) continue;
@@ -922,24 +931,25 @@
           const deficit = rule.target-current;
           if (deficit <= 0) { replenishing.delete(rule.name); continue; }
           const unit = product.unit ?? 1;
-          if (!Number.isSafeInteger(unit) || unit < 1) { halt('商品份量不符'); return; }
+          if (!Number.isSafeInteger(unit) || unit < 1) { skip(rule.name, '商品份量不符'); continue; }
           const count = Math.min(9999,Math.ceil(deficit/unit)), units = count*unit;
-          if (a.blockedItem?.(rule.name)) { halt(`${rule.name}同時在刪物清單`); return; }
-          if (!Number.isSafeInteger(shop.id) || !Number.isSafeInteger(product.orderId) || !Number.isSafeInteger(product.price) || product.price < 0) { halt('商店資料不符'); return; }
+          if (a.blockedItem?.(rule.name)) { skip(rule.name, '同時啟用販賣或存倉'); continue; }
+          if (!Number.isSafeInteger(shop.id) || !Number.isSafeInteger(product.orderId) || !Number.isSafeInteger(product.price) || product.price < 0) { skip(rule.name, '商店資料不符'); continue; }
           const gold = total(items,'金幣'), cost = count*product.price;
-          if (!Number.isSafeInteger(cost) || gold < cost) { halt('金幣不足'); return; }
+          if (!Number.isSafeInteger(cost) || gold < cost) { skip(rule.name, '金幣不足'); continue; }
           pending = { shopId:shop.id,shopName:shop.name,target:rule.target,name:rule.name,count,units,cost,beforeGold:gold,beforeCount:total(items,rule.name),deadline:null,spent:0,gained:0,observed:new Map(items.filter(item => item.fullName === '金幣' || item.fullName === rule.name).map(item => [item.id,{name:item.fullName,count:item.count}])) };
           pending.deadline = schedule(timeout,5000);
           cancelTick(); text(`補給${rule.name}×${units}`); changed();
           try { a.send({t:'shop.buy',npcId:shop.id,lines:[{orderId:product.orderId,count}]}); }
-          catch { halt('購買結果未確認'); }
+          catch { skip(rule.name, '送出購買時發生錯誤，請先確認交易結果'); }
           return;
         }
-        lastCheck = checkKey; text('物品尚有庫存');
+        lastCheck = checkKey; text(idleStatus());
       } catch { text('等待完整背包資料'); }
     }
     function enable(value) {
       if (value !== true) replenishing.clear();
+      if (value === true && !enabled && !pending) blocked.clear();
       enabled = value === true; paused = false; lastCheck = ''; cancelTick();
       text(enabled ? '準備補貨' : pending ? '已停用，等待最後一筆結果' : '未啟動'); changed(); tick(); wake();
     }
@@ -963,7 +973,7 @@
       if(msg.t==='inv.list') { defer(()=>{if(disposed)return;ready=true;confirm();wake();}); return; }
       if(['inv.add','inv.update','inv.remove'].includes(msg.t)&&pending) { observePurchase(msg); defer(confirm); }
     }
-    return {state,settings,tick,receive,enable,upsert,restore,remove(name){replenishing.delete(name);rules=rules.filter(x=>x.name!==name);lastCheck='';changed();if(!rules.length)cancelTick();},
+    return {state,settings,tick,receive,enable,upsert,restore,remove(name){replenishing.delete(name);blocked.delete(name);rules=rules.filter(x=>x.name!==name);lastCheck='';changed();if(!rules.length)cancelTick();},
       setReady(){ready=true;tick();wake();}, stop(){enable(false);},
       dispose(){disposed=true;cancelTick();release();} };
   }
