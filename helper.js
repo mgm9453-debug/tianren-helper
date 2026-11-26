@@ -852,13 +852,14 @@
     const schedule = a.schedule || setTimeout, cancel = a.cancel || clearTimeout, defer = a.defer || queueMicrotask;
     let enabled = false, rules = [], pending = null, timer = null, paused = false, ready = a.initialReady === true, disposed = false, status = '未啟動';
     let revision = 0, lastCheck = '';
+    const replenishing = new Set();
     const settings = () => ({ enabled, rules: rules.map(x => ({ ...x })) });
     const state = () => ({ ...settings(), pending: !!pending, paused, status });
     const changed = () => { if (!disposed) a.changed?.(state()); };
     const text = value => { if (status !== value) { status = value; changed(); } };
     function cancelTick() { if (timer != null) cancel(timer); timer = null; }
     function release() { if (pending) cancel(pending.deadline); pending = null; }
-    function halt(message) { release(); paused = true; cancelTick(); text(message + '；取消再勾選啟動可重試'); changed(); }
+    function halt(message) { replenishing.clear(); release(); paused = true; cancelTick(); text(message + '；取消再勾選啟動可重試'); changed(); }
     function wake() { if (timer == null && !disposed && enabled && !paused && !pending && rules.length) timer = schedule(() => { timer = null; tick(); wake(); }, 1000); }
     function inventory() {
       const items = a.all();
@@ -893,7 +894,9 @@
       try {
         const items = inventory(), count = total(items,pending.name), gold = total(items,'金幣');
         if ((count >= pending.beforeCount+pending.units || pending.gained >= pending.units) && (gold === pending.beforeGold-pending.cost || pending.spent === pending.cost)) {
-          const finished = pending; release(); text(`已補貨：${finished.name}＋${finished.units}`); changed(); wake();
+          const finished = pending;
+          if (finished.beforeCount+finished.units >= finished.target) replenishing.delete(finished.name);
+          release(); text(`已補貨：${finished.name}＋${finished.units}`); changed(); wake();
         }
       } catch {}
     }
@@ -906,14 +909,18 @@
       try { shop = a.shopFor ? a.shopFor('肉') : a.nearby(); } catch { text('等待場景資料'); return; }
       if (!shop) { text('等待商人資料'); return; }
       const checkKey = `${a.shopFor ? rules.map(rule => a.shopFor(rule.name)?.id).join(',') : shop.id}:${revision}`;
-      if (lastCheck === checkKey) { text('補給已達標'); return; }
+      if (lastCheck === checkKey) { text('物品尚有庫存'); return; }
       try {
         const items = inventory();
         for (const rule of rules) {
           if (a.shopFor) shop = a.shopFor(rule.name);
           const product = shop.items.find(x => x.name === rule.name);
           if (!product) continue;
-          const deficit = rule.target-total(items,rule.name); if (deficit <= 0) continue;
+          const current = total(items,rule.name);
+          if (current === 0) replenishing.add(rule.name);
+          if (!replenishing.has(rule.name)) continue;
+          const deficit = rule.target-current;
+          if (deficit <= 0) { replenishing.delete(rule.name); continue; }
           const unit = product.unit ?? 1;
           if (!Number.isSafeInteger(unit) || unit < 1) { halt('商品份量不符'); return; }
           const count = Math.min(9999,Math.ceil(deficit/unit)), units = count*unit;
@@ -928,10 +935,11 @@
           catch { halt('購買結果未確認'); }
           return;
         }
-        lastCheck = checkKey; text('補給已達標');
+        lastCheck = checkKey; text('物品尚有庫存');
       } catch { text('等待完整背包資料'); }
     }
     function enable(value) {
+      if (value !== true) replenishing.clear();
       enabled = value === true; paused = false; lastCheck = ''; cancelTick();
       text(enabled ? '準備補貨' : pending ? '已停用，等待最後一筆結果' : '未啟動'); changed(); tick(); wake();
     }
@@ -942,7 +950,7 @@
       changed(); tick(); wake();
     }
     function restore(value) {
-      cancelTick(); lastCheck=''; const unique=new Map();
+      cancelTick(); replenishing.clear(); lastCheck=''; const unique=new Map();
       for(const rule of Array.isArray(value?.rules)?value.rules:[]) if(valid(rule)) unique.set(rule.name,{name:rule.name,target:rule.target});
       rules=[...unique.values()]; enabled=value?.enabled===true; paused=false;
       text(enabled?'準備補貨':'未啟動'); changed(); tick(); wake();
@@ -955,7 +963,7 @@
       if(msg.t==='inv.list') { defer(()=>{if(disposed)return;ready=true;confirm();wake();}); return; }
       if(['inv.add','inv.update','inv.remove'].includes(msg.t)&&pending) { observePurchase(msg); defer(confirm); }
     }
-    return {state,settings,tick,receive,enable,upsert,restore,remove(name){rules=rules.filter(x=>x.name!==name);lastCheck='';changed();if(!rules.length)cancelTick();},
+    return {state,settings,tick,receive,enable,upsert,restore,remove(name){replenishing.delete(name);rules=rules.filter(x=>x.name!==name);lastCheck='';changed();if(!rules.length)cancelTick();},
       setReady(){ready=true;tick();wake();}, stop(){enable(false);},
       dispose(){disposed=true;cancelTick();release();} };
   }
@@ -1228,7 +1236,7 @@
 (() => {
   'use strict';
   if (window.__天仁輔助) {
-    if (window.__天仁輔助.version !== '1.8.5') {
+    if (window.__天仁輔助.version !== '1.8.6') {
       try {
         const 角色名 = window.__wl?.world?.selfName?.();
         if (!角色名) { alert('角色資料尚未就緒，請稍後再點書籤，先不要重新整理。'); return; }
@@ -1273,8 +1281,8 @@
   const 主框 = document.createElement('section');
   主框.id = '裝備強化第一版';
   主框.setAttribute('aria-label', 'TR輔助');
-  主框.dataset.version = '1.8.5';
-  主框.innerHTML = `<style>${window.天仁介面樣式} #裝備強化第一版 header{gap:5px} #裝備強化第一版 .brand{font-size:17px;gap:0} #裝備強化第一版 .brand-mark{display:none} #裝備強化第一版 .window-actions{align-items:center} #裝備強化第一版 [data-ui=licenseCountdown]{font-size:13px;font-weight:600;color:var(--金);font-variant-numeric:tabular-nums;white-space:nowrap;margin-right:2px} #裝備強化第一版.is-collapsed [data-ui=licenseCountdown]{display:none}</style><header><span class="brand"><span class="brand-mark" aria-hidden="true">TR</span><span>TR輔助<span class="build-label">1.8.5 · 正式版</span></span></span><span class="window-actions"><span data-ui="licenseCountdown" aria-label="金鑰剩餘時間"></span><button data-ui="collapse" aria-label="收合面板" aria-expanded="true">收合</button><button data-ui="close" aria-label="關閉並停止">×</button></span></header>
+  主框.dataset.version = '1.8.6';
+  主框.innerHTML = `<style>${window.天仁介面樣式} #裝備強化第一版 header{gap:5px} #裝備強化第一版 .brand{font-size:17px;gap:0} #裝備強化第一版 .brand-mark{display:none} #裝備強化第一版 .window-actions{align-items:center} #裝備強化第一版 [data-ui=licenseCountdown]{font-size:13px;font-weight:600;color:var(--金);font-variant-numeric:tabular-nums;white-space:nowrap;margin-right:2px} #裝備強化第一版.is-collapsed [data-ui=licenseCountdown]{display:none}</style><header><span class="brand"><span class="brand-mark" aria-hidden="true">TR</span><span>TR輔助<span class="build-label">1.8.6 · 正式版</span></span></span><span class="window-actions"><span data-ui="licenseCountdown" aria-label="金鑰剩餘時間"></span><button data-ui="collapse" aria-label="收合面板" aria-expanded="true">收合</button><button data-ui="close" aria-label="關閉並停止">×</button></span></header>
   <nav role="tablist" aria-label="輔助功能"><button role="tab" data-tab="health" data-ui="healthTab" aria-selected="true">血量保護</button><button role="tab" data-tab="repair" aria-selected="false">功能</button><button role="tab" data-tab="shopping" aria-selected="false">自動補給</button><button role="tab" data-tab="selling" aria-selected="false">自動販賣</button><button role="tab" data-tab="storage" aria-selected="false">自動存倉</button><button role="tab" data-tab="enchant" aria-selected="false">點裝備</button></nav>
   <div data-pane="health"></div>
   <div data-pane="repair" hidden><label><input data-ui="day" type="checkbox"> 全白天</label><div data-ui="dayStatus" hidden></div><hr><label><input data-ui="autoRepair" type="checkbox" checked> 自動修武器</label><button data-ui="repairScan">重新讀取背包</button><div data-ui="repairStatus" role="status" aria-live="polite">正在讀取背包…</div></div>
@@ -1676,7 +1684,7 @@
     if (msg.t === 'world.enter' || msg.t === 'self.status' || msg.t === 'obj.put' && msg.obj?.id === window.__wl.world?.selfId) queueMicrotask(() => { if (!已關閉 && 設定保存.sync(角色待還原)) 角色待還原 = false; });
   });
   設定保存.sync();
-  window.__天仁輔助 = { version: '1.8.5', show() { 主框.hidden = false; 元素('healthTab').click(); }, close() { 存倉管理?.stop(); 販賣管理?.stop(); 購買管理?.stop(); 血量管理?.stop(); 保護擴充?.stop(); 停止修理(); 停止(); 主框.hidden = true; } };
+  window.__天仁輔助 = { version: '1.8.6', show() { 主框.hidden = false; 元素('healthTab').click(); }, close() { 存倉管理?.stop(); 販賣管理?.stop(); 購買管理?.stop(); 血量管理?.stop(); 保護擴充?.stop(); 停止修理(); 停止(); 主框.hidden = true; } };
   window.__天仁輔助.licenseStop = () => {
     if(已關閉)return;
     設定保存?.save(); 已關閉=true;
